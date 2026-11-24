@@ -1,35 +1,36 @@
 // Overhang-exhaustion paper bot for the pump.fun bonding-curve replay (agent-fun/replay/v2).
 //
-// v3: buy the exhaustion, ride the dispersed coins to completion. See
-// STRATEGY-v3.md for the full reasoning; the short version, from the FULL dev
-// window (all 3 dataset parts, 128,058 events, 1,222 mints):
-//   - Generic dip-buying loses (only 16-29% of dips bounce >= +20% in 600
-//     slots; ~half fall a further >= 20%). The kit's reversion pilot scores
-//     -4.02 SOL on the full window.
-//   - 35 coins complete, but 28 complete in their creation slot (untradeable:
-//     the harness applies the whole batch before the bot acts, and the 2-slot
-//     fill latency kills even the age-1 completer). The 7 tradeable ("slow")
-//     completers take 345-2,205 slots, end with 248-1,019 buyers and topShare
-//     0.02-0.05, dip 20-65% along the way, and pay 1.4x-11.6x from dip prices.
-//   - A dip-RECOVERY (dip >= 30% from peak, then price retakes the old peak)
-//     completes 11% of the time (11/99 events); with the dispersion filter
-//     (buyers >= 50, topShare <= 0.2, rq >= 15) it is 17% (10/60), median
-//     forward max 1.36x. "Stabilisation" triggers (no new low for 50-100
-//     slots) are value traps: 2-5% completion, EV -2.4 to -4.4 SOL.
-//   - The edge is scale-into-strength, not the entry alone: losers stall
-//     early (they never earn adds, so they only ever cost the 0.15 first
-//     buy), while winners keep rising and keep earning adds — so deployed
-//     capital concentrates into the coins that complete. Adds fire on rq
-//     growth (+5 rq above the last buy, price above the last buy's price),
-//     up to 2.0 SOL at cost per coin.
-//   - Exits ride to completion: NO take-profit; a wide trailing stop (50%
-//     below the peak value since entry — completers dip 20-65% mid-ride, so
-//     a tight stop kills the winners); stale after 600 slots; max hold 4,000.
-//   - Sells are chunked: a sell is rejected when its proceeds exceed the
-//     curve's real SOL reserves, so a big position on a collapsed coin gets
-//     stuck (this is what killed v2's completion-rider test). Each chunk's
-//     proceeds stay under ~50% of current rq.
-//
+// v5: the max build. v3 (dip-recovery + scale-into-strength, grade-local
+// +3.021 SOL, ~#5-6 on the dev board) is a concentrated bet on 2 of the 7
+// tradeable slow completers: 98% of its gains come from its top 3 coins,
+// and its worst trip (-1.207 SOL) is a coin that rose enough to earn full
+// adds, then dumped through the 0.38 trail. v5 attacks the gaps with every
+// lever verified in tools/backtest-full.ts and kept only if it helps on the
+// full window (all numbers below are the full-window backtest):
+//   1. Whale-sell threshold 5 -> 6 SOL (+1.29 alone): v3's >= 5 SOL exit cut
+//      the 3rd completer, 6MVWPQwr2Y, on a single 5.893 SOL sell 54 slots
+//      after entry (verified in the raw tape). 6.0-6.5 is a flat plateau
+//      that saves the completer and still catches a 6.5-7 SOL dump.
+//   2. Momentum sleeve (dip 15% + full recovery, rq >= 35, first buy 0.10,
+//      stake 0.30, max 2): catches the momentum-only completer CHjgAurRkf
+//      (+0.299) and pre-empts 9JvXQrnYmo early (+0.092 instead of -1.207).
+//   3. Selective creator-sold entries (rq >= 35, first buy 0.15, no adds
+//      until >1.5x cost): catches Hhcck7SDvK (+0.493), one of the 2
+//      creator-sold completers v3's absolute filter excluded.
+//   4. Entry rq cap 70 -> 60 (flat region 55-65): the rq 65-70 band holds
+//      exactly one dev entry and it is the -1.207 SOL disaster.
+//   5. Trail 0.38 -> 0.35 (flat plateau 0.34-0.36 at +6.21-6.24; 0.33 is a
+//      cliff, 0.30 worse still) and an add cap (no adds once value > 2x
+//      cost) that stops capital piling into a single coin at the top.
+//   Tested and REJECTED by the data: the two-stage trail (wide 0.45 +
+//   tight 0.25 changes nothing once the whale-sell threshold is fixed —
+//   the mechanism stays in code with trailTight == trail); bigger momentum
+//   stakes (0.5-1.0 SOL lose vs 0.30); stakeSol below 3.0 (cuts the
+//   completers' payoff); disabling the whale-sell exit entirely.
+//   Full-window backtest: net +6.249 SOL, 173 fills, 59 coins, 65 trips,
+//   10 wins, max drawdown 12.0%, 2x fees +5.632. Still concentrated — the
+//   top coin is ~60% of gross gains — because only 7 slow completers
+//   exist in dev; v5 catches 4 of them (v3 caught 2).
 // Everything is a pure function of the batches: no clock, no environment, no
 // randomness, so the two graded executions produce byte-identical action logs.
 // Iteration is only over insertion-ordered maps fed by the batch stream.
@@ -81,14 +82,22 @@ export interface Params {
   buySlipBps: number;
   /** Add only once real SOL has risen this much above the last buy's rq. */
   addRqStep: number;
+  /** v5: no more adds once a position's value exceeds cost * this (0 = off). */
+  addStopValueMult: number;
   // -- exits --
   /** Sell the whole position once its value reaches cost * (1 + takeProfit).
-   *  v3 rides to completion, so this is set so high it effectively never fires. */
+   *  v5 rides to completion, so this is set so high it effectively never fires. */
   takeProfit: number;
   /** Last-resort floor: sell once value falls to cost * (1 - stopLoss). */
   stopLoss: number;
-  /** Trailing stop from the position's best value since entry (fraction). */
+  /** Trailing stop from the position's best value since entry (fraction),
+   *  while the position is below trailSwitchMult of cost. */
   trail: number;
+  /** v5: trailing stop once the position is up past trailSwitchMult of cost
+   *  (equal to `trail` = the v3 single-stage trail). */
+  trailTight: number;
+  /** v5: value multiple of cost at which the trail switches to trailTight. */
+  trailSwitchMult: number;
   /** Exit after this many slots held (unless the position is up). */
   maxHold: number;
   /** Exit when no trade has hit the coin for this many slots. */
@@ -97,10 +106,34 @@ export interface Params {
   bigSellSol: number;
   /** Slots to wait after an exit before the same coin may be bought again. */
   cooldown: number;
-  /** Most entries per coin over the run. */
+  /** Most entries per coin over the run (shared across both sleeves). */
   maxEntries: number;
   /** Each sell chunk's proceeds stay under this share of current real SOL. */
   sellChunkRq: number;
+  // -- momentum sleeve (v5; dipMin 0 = the sleeve is off) --
+  /** A momentum dip arms once the price falls this far below the running peak. */
+  momDipMin: number;
+  /** ...and the entry fires once the price has retraced this share of the dip. */
+  momRecoverShare: number;
+  /** Real SOL lower bound at a momentum entry (upper bound is maxRqEntry). */
+  momMinRqEntry: number;
+  /** Fewest distinct non-creator buyers for a momentum entry. */
+  momMinBuyersDisp: number;
+  /** Largest single wallet's share of lifetime buy SOL for a momentum entry. */
+  momMaxTopShareDisp: number;
+  /** First buy of a momentum position (SOL). */
+  momFirstBuySol: number;
+  /** Most SOL at cost in one momentum position. */
+  momStakeSol: number;
+  /** Most momentum positions open at once. */
+  momMaxPositions: number;
+  // -- selective creator-sold entries (v5; minRq 0 = the filter stays absolute) --
+  /** Creator-sold coins may be entered only at real SOL >= this. */
+  csMinRq: number;
+  /** First buy of a creator-sold position (SOL). */
+  csFirstBuySol: number;
+  /** A creator-sold position may add only once its value exceeds cost * this. */
+  csAddConfirmMult: number;
   // -- caps and pacing --
   /** Most main positions open at once (the rest of the cap is for probes). */
   maxMain: number;
@@ -125,7 +158,7 @@ export const DEFAULT_PARAMS: Params = {
   minBuyersDisp: 50,
   maxTopShareDisp: 0.4,
   minRqEntry: 15,
-  maxRqEntry: 70,
+  maxRqEntry: 60,
   minAge: 50,
   minMult: 1.5,
   firstBuySol: 0.15,
@@ -134,15 +167,29 @@ export const DEFAULT_PARAMS: Params = {
   minBuySol: 0.01,
   buySlipBps: 1500,
   addRqStep: 3,
+  addStopValueMult: 2.0,
   takeProfit: 10,
   stopLoss: 0.7,
-  trail: 0.38,
+  trail: 0.35,
+  trailTight: 0.35,
+  trailSwitchMult: 1.5,
   maxHold: 4000,
   staleSlots: 600,
-  bigSellSol: 5,
+  bigSellSol: 6,
   cooldown: 0,
   maxEntries: 1,
   sellChunkRq: 0.5,
+  momDipMin: 0.15,
+  momRecoverShare: 1.0,
+  momMinRqEntry: 35,
+  momMinBuyersDisp: 50,
+  momMaxTopShareDisp: 0.4,
+  momFirstBuySol: 0.1,
+  momStakeSol: 0.3,
+  momMaxPositions: 2,
+  csMinRq: 35,
+  csFirstBuySol: 0.15,
+  csAddConfirmMult: 1.5,
   maxMain: 5,
   targetCoins: 25,
   targetFills: 60,
@@ -202,6 +249,23 @@ interface Coin {
   /** Price and slot when the recovery fired. */
   recoveryPrice: number;
   recoverySlot: number;
+  // -- momentum-sleeve dip state (independent tracker, shallower dip) --
+  /** Highest trade price seen by the momentum tracker since the last reset. */
+  momPeakPrice: number;
+  /** Real SOL when the momentum peak was set. */
+  momPeakRq: number;
+  /** True once the price has dipped momDipMin below the momentum peak. */
+  momDipped: boolean;
+  /** Lowest price seen while in a momentum dip. */
+  momDipPrice: number;
+  /** The peak the current momentum dip fell from, and its real SOL. */
+  momDipPeakPrice: number;
+  momDipPeakRq: number;
+  /** True once the price retraced momRecoverShare of the momentum dip. */
+  momRecovered: boolean;
+  /** Price and slot when the momentum recovery fired. */
+  momRecoveryPrice: number;
+  momRecoverySlot: number;
 }
 
 interface Held {
@@ -216,6 +280,10 @@ interface Held {
   lastAddRq: number;
   /** Close value at the latest batch (SOL, curve and tx fees deducted). */
   lastValue: number;
+  /** Which sleeve opened this position. */
+  sleeve: 'main' | 'mom';
+  /** True when the entry was a selective creator-sold entry. */
+  cs: boolean;
 }
 
 export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
@@ -232,7 +300,7 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
   const coinOf = (mint: Pubkey): Coin => {
     let c = coins.get(mint);
     if (c === undefined) {
-      c = { created: null, creator: null, creatorSold: false, createPrice: 0, buyers: new Set(), buySolByUser: new Map(), totalBuySol: 0, lastTradeSlot: 0, entries: 0, lastExit: NEVER_EXITED, peakPrice: 0, peakRq: 0, dipped: false, dipPrice: 0, dipPeakPrice: 0, dipPeakRq: 0, recovered: false, recoveryPrice: 0, recoverySlot: 0 };
+      c = { created: null, creator: null, creatorSold: false, createPrice: 0, buyers: new Set(), buySolByUser: new Map(), totalBuySol: 0, lastTradeSlot: 0, entries: 0, lastExit: NEVER_EXITED, peakPrice: 0, peakRq: 0, dipped: false, dipPrice: 0, dipPeakPrice: 0, dipPeakRq: 0, recovered: false, recoveryPrice: 0, recoverySlot: 0, momPeakPrice: 0, momPeakRq: 0, momDipped: false, momDipPrice: 0, momDipPeakPrice: 0, momDipPeakRq: 0, momRecovered: false, momRecoveryPrice: 0, momRecoverySlot: 0 };
       coins.set(mint, c);
     }
     return c;
@@ -274,6 +342,43 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
     }
   };
 
+  /** Fold one trade into the momentum sleeve's shallower dip tracker.
+   *  Independent state: a coin can arm a momentum recovery without ever
+   *  dipping far enough to arm the main trigger. Skipped entirely while the
+   *  sleeve is off (momDipMin 0), so it cannot change main behaviour. */
+  const trackMomDip = (c: Coin, slot: number, price: number, rq: number): void => {
+    if (p.momDipMin <= 0) return;
+    if (!c.momDipped) {
+      if (price > c.momPeakPrice) {
+        c.momPeakPrice = price;
+        c.momPeakRq = rq;
+      }
+      if (c.momPeakPrice > 0 && price <= c.momPeakPrice * (1 - p.momDipMin)) {
+        c.momDipped = true;
+        c.momDipPrice = price;
+        c.momDipPeakPrice = c.momPeakPrice;
+        c.momDipPeakRq = c.momPeakRq;
+      }
+      return;
+    }
+    if (price < c.momDipPrice) c.momDipPrice = price;
+    const retrace = c.momDipPrice + (c.momPeakPrice - c.momDipPrice) * p.momRecoverShare;
+    if (price >= retrace) {
+      c.momDipped = false;
+      c.momRecovered = true;
+      c.momRecoveryPrice = price;
+      c.momRecoverySlot = slot;
+      c.momPeakPrice = price;
+      c.momPeakRq = rq;
+      return;
+    }
+    if (price <= c.momPeakPrice * p.collapseReset) {
+      c.momDipped = false;
+      c.momPeakPrice = price;
+      c.momPeakRq = rq;
+    }
+  };
+
   /** Largest single wallet's share of lifetime buy SOL (0 when nothing bought). */
   const topShare = (c: Coin): number => {
     if (c.totalBuySol <= 0) return 0;
@@ -282,20 +387,45 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
     return top / c.totalBuySol;
   };
 
-  /** Dip-recovery entry signal on a coin's tape at slot `now`. */
-  const entrySignal = (c: Coin, now: number, rqSol: number, price: number): boolean => {
-    if (!c.recovered) return false;
-    if (now - c.recoverySlot > p.recoverWindow) return false;
-    if (price > c.recoveryPrice * p.recoverChase) return false;
-    if (rqSol < p.minRqEntry || rqSol > p.maxRqEntry) return false;
+  /** Dip-recovery entry signal on a coin's tape at slot `now`.
+   *  Returns 'main' for a regular entry, 'cs' for a selective creator-sold
+   *  entry, or null for no entry. */
+  const entrySignal = (c: Coin, now: number, rqSol: number, price: number): 'main' | 'cs' | null => {
+    if (!c.recovered) return null;
+    if (now - c.recoverySlot > p.recoverWindow) return null;
+    if (price > c.recoveryPrice * p.recoverChase) return null;
+    if (rqSol < p.minRqEntry || rqSol > p.maxRqEntry) return null;
+    if (c.created === null || now - c.created < p.minAge) return null;
+    if (c.createPrice <= 0) return null;
+    if (price / c.createPrice < p.minMult) return null;
+    if (c.dipPeakPrice / c.createPrice < p.minPeakMult) return null;
+    if (c.dipPeakRq < p.minPeakRq) return null;
+    if (c.buyers.size < p.minBuyersDisp) return null;
+    if (topShare(c) > p.maxTopShareDisp) return null;
+    if (c.creatorSold) {
+      // Selective creator-sold entry: only at high real SOL, small size.
+      if (p.csMinRq > 0 && rqSol >= p.csMinRq) return 'cs';
+      return null;
+    }
+    return 'main';
+  };
+
+  /** Momentum-sleeve entry signal: a shallower dip + full recovery on a coin
+   *  with strong real SOL. The sleeve never touches creator-sold coins. */
+  const momEntrySignal = (c: Coin, now: number, rqSol: number, price: number): boolean => {
+    if (p.momDipMin <= 0) return false;
+    if (!c.momRecovered) return false;
+    if (now - c.momRecoverySlot > p.recoverWindow) return false;
+    if (price > c.momRecoveryPrice * p.recoverChase) return false;
+    if (rqSol < p.momMinRqEntry || rqSol > p.maxRqEntry) return false;
     if (c.created === null || now - c.created < p.minAge) return false;
     if (c.creatorSold) return false;
     if (c.createPrice <= 0) return false;
     if (price / c.createPrice < p.minMult) return false;
-    if (c.dipPeakPrice / c.createPrice < p.minPeakMult) return false;
-    if (c.dipPeakRq < p.minPeakRq) return false;
-    if (c.buyers.size < p.minBuyersDisp) return false;
-    if (topShare(c) > p.maxTopShareDisp) return false;
+    if (c.momDipPeakPrice / c.createPrice < p.minPeakMult) return false;
+    if (c.momDipPeakRq < p.minPeakRq) return false;
+    if (c.buyers.size < p.momMinBuyersDisp) return false;
+    if (topShare(c) > p.momMaxTopShareDisp) return false;
     return true;
   };
 
@@ -324,9 +454,16 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
   const hitTakeProfit = (value: number, cost: number): boolean => value >= cost * (1 + p.takeProfit);
   /** Last-resort floor: value fell to cost * (1 - stopLoss). */
   const hitStopLoss = (value: number, cost: number): boolean => value < cost * (1 - p.stopLoss);
-  /** Trailing stop from the position's best value since entry, armed from the first mark. */
-  const hitTrailingStop = (h: Held, value: number): boolean =>
-    h.peakValue > 0 && value < h.peakValue * (1 - p.trail);
+  /** Two-stage trailing stop from the position's best value since entry.
+   *  Wide while the position is young (a completer dips 20-65% mid-ride);
+   *  tight once the position is up past trailSwitchMult of cost, so a
+   *  pumped-and-dumped coin exits with most of its gain. Armed from the
+   *  first mark. With trailTight == trail this is the v3 single-stage stop. */
+  const hitTrailingStop = (h: Held, value: number, cost: number): boolean => {
+    if (h.peakValue <= 0) return false;
+    const trail = cost > 0 && value > cost * p.trailSwitchMult ? p.trailTight : p.trail;
+    return value < h.peakValue * (1 - trail);
+  };
   /** Time limit: held past maxHold while below MAX_HOLD_EXIT_BELOW of cost. */
   const heldTooLong = (h: Held, value: number, cost: number, now: number): boolean =>
     now - h.opened > p.maxHold && value < cost * MAX_HOLD_EXIT_BELOW;
@@ -338,9 +475,11 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
     if (h.exiting) return true;
     if (hitTakeProfit(value, cost)) return true;
     if (hitStopLoss(value, cost)) return true;
-    if (hitTrailingStop(h, value)) return true;
+    if (hitTrailingStop(h, value, cost)) return true;
     if (bigSell) return true;
-    if (c.creatorSold) return true;
+    // A selective creator-sold entry already priced the creator's sale in;
+    // only a FRESH creator sale after entry exits the position.
+    if (c.creatorSold && !h.cs) return true;
     if (goneStale(c, now)) return true;
     if (heldTooLong(h, value, cost, now)) return true;
     return false;
@@ -361,22 +500,27 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
     return exposure;
   };
 
-  /** True when a fresh first buy may be opened on this coin right now. */
-  const mayEnter = (c: Coin, now: number, rqSol: number, price: number, slotsLeft: number, mainLeft: number): boolean => {
-    if (slotsLeft <= 0 || mainLeft <= 0) return false;
-    if (c.entries >= p.maxEntries || now - c.lastExit < p.cooldown) return false;
-    return entrySignal(c, now, rqSol, price);
+  /** Count of open positions in one sleeve. */
+  const sleeveCount = (sleeve: 'main' | 'mom'): number => {
+    let n = 0;
+    for (const h of held.values()) if (h.sleeve === sleeve) n++;
+    return n;
   };
 
   /** Size of an add-on buy for a held position, or null when no add is warranted.
    *  Adds scale into strength: real SOL must have risen addRqStep above the last
-   *  buy's rq and the price must be above the last buy's price. */
+   *  buy's rq and the price must be above the last buy's price. v5 guards:
+   *  no adds once value exceeds cost * addStopValueMult (concentration cap),
+   *  and a creator-sold position adds only after it proves itself. */
   const addAmount = (c: Coin, h: Held, mint: Pubkey, price: number, rqSol: number, state: BotState): number | null => {
-    if (h.exiting || !h.filled || h.invested >= p.stakeSol - p.minBuySol) return null;
+    const stake = h.sleeve === 'mom' ? p.momStakeSol : p.stakeSol;
+    if (h.exiting || !h.filled || h.invested >= stake - p.minBuySol) return null;
     if (state.positions.get(mint) === undefined) return null;
     if (rqSol < h.lastAddRq + p.addRqStep) return null;
     if (price < h.lastAddPrice) return null;
-    return Math.min(p.addSol, p.stakeSol - h.invested);
+    if (p.addStopValueMult > 0 && h.lastValue > h.invested * p.addStopValueMult) return null;
+    if (h.cs && h.lastValue <= h.invested * p.csAddConfirmMult) return null;
+    return Math.min(p.addSol, stake - h.invested);
   };
 
   /** Which guardrail counters lag the pace at the current clock. */
@@ -444,6 +588,7 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
           if (!e.is_buy && sol >= p.bigSellSol) bigSell.add(e.mint);
           if (!e.is_buy && c.creator !== null && e.user === c.creator) c.creatorSold = true;
           trackDip(c, e.slot, price, rq);
+          trackMomDip(c, e.slot, price, rq);
         }
       }
 
@@ -504,7 +649,8 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
       // --- phase 3: entries and adds ---
       let free = Number(state.freeCashLamports()) / LAMPORTS;
       let slotsLeft = state.hello.caps.max_open_positions - state.committedPositionCount();
-      let mainLeft = p.maxMain - held.size;
+      let mainLeft = p.maxMain - sleeveCount('main');
+      let momLeft = p.momMaxPositions - sleeveCount('mom');
       let exposure = totalExposure(state);
       for (const mint of traded) {
         if (orders.length >= cap) break;
@@ -516,9 +662,24 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         const price = Number(curve.virtual_quote_reserves) / Number(curve.virtual_token_reserves);
         const rqSol = Number(curve.real_quote_reserves) / LAMPORTS;
         let want: number;
+        let newSleeve: 'main' | 'mom' | null = null;
+        let newCs = false;
         if (h === undefined) {
-          if (!mayEnter(c, now, rqSol, price, slotsLeft, mainLeft)) continue;
-          want = p.firstBuySol;
+          if (slotsLeft <= 0) continue;
+          if (c.entries >= p.maxEntries || now - c.lastExit < p.cooldown) continue;
+          const sig = entrySignal(c, now, rqSol, price);
+          if (sig !== null) {
+            if (mainLeft <= 0) continue;
+            want = sig === 'cs' ? p.csFirstBuySol : p.firstBuySol;
+            newSleeve = 'main';
+            newCs = sig === 'cs';
+          } else if (momEntrySignal(c, now, rqSol, price)) {
+            if (momLeft <= 0) continue;
+            want = p.momFirstBuySol;
+            newSleeve = 'mom';
+          } else {
+            continue;
+          }
         } else {
           // Add into strength only: real SOL climbed a step past the last buy
           // and the price is above the last buy's price.
@@ -532,10 +693,11 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         free -= amount + tx;
         exposure += amount;
         if (h === undefined) {
-          held.set(mint, { opened: now, peakValue: 0, invested: amount, exiting: false, filled: false, lastAddPrice: price, lastAddRq: rqSol, lastValue: 0 });
+          held.set(mint, { opened: now, peakValue: 0, invested: amount, exiting: false, filled: false, lastAddPrice: price, lastAddRq: rqSol, lastValue: 0, sleeve: newSleeve!, cs: newCs });
           c.entries++;
           slotsLeft--;
-          mainLeft--;
+          if (newSleeve === 'main') mainLeft--;
+          else momLeft--;
         } else {
           h.invested += amount;
           h.lastAddPrice = price;
