@@ -1,29 +1,34 @@
-// Fast whale-pump paper bot for the pump.fun bonding-curve replay (agent-fun/replay/v2).
+// Overhang-exhaustion paper bot for the pump.fun bonding-curve replay (agent-fun/replay/v2).
 //
-// v2: catch the whale pump, bank +25%, get out before the dump. See
-// STRATEGY-v2.md for the full reasoning; the short version, from the FULL dev
-// window (all 3 dataset parts, 128,058 events, 1,222 mints — the kit sim only
-// reads part-00000, which is why v1's sim and grade-local disagreed so much):
-//   - The first v2 thesis was backwards. Completers are NOT broad and organic:
-//     at rq 12, coins with 0-5 buyers complete 28% of the time, coins with
-//     40+ buyers 0%; topShare 0.4-0.6 completes 25% vs 2% for 0-0.2; age 0-20
-//     completes 16% vs 0% for age 60+. Completers are fast, whale-driven coins
-//     that rocket to rq 12 in ~0 slots with ~4 buyers and a dominant whale.
-//   - The entry filter therefore selects whale pumps, not survivors: age 0-30,
-//     real SOL 12-45, 1-8 lifetime buyers, price >= 2x create, window top
-//     share >= 0.4, price within 5% of its 100-slot high. 50 coins qualify;
-//     only 1 completes, so the edge is NOT completion — it is that whale pumps
-//     reliably run a further +25-30% before dumping, and the take-profit banks it.
-//   - Exits are tight and asymmetric: take profit +25% (the flat peak of the
-//     TP curve: 0.25-0.30 both give +0.14 on the strict filter), stop loss
-//     -25% (a 15% stop cuts winners mid-dip), exit on any single >= 3 SOL
-//     sell (the whale leaving), stale after 200 slots, max hold 600.
-//     The trailing stop never fires on this config; pyramiding (adds) hurts.
-//   - One 0.15 SOL buy per coin, no adds: the 1% of real reserve order cap
-//     clips it to ~0.12 SOL at rq 12 anyway, and bigger size loses more.
-//   - Guardrail probes are OFF (targetCoins/targetFills 0): the 50 main
-//     entries clear the >= 20 coin guardrail on their own, and the probes
-//     were a -0.07 SOL drag that also stole position slots.
+// v3: buy the exhaustion, ride the dispersed coins to completion. See
+// STRATEGY-v3.md for the full reasoning; the short version, from the FULL dev
+// window (all 3 dataset parts, 128,058 events, 1,222 mints):
+//   - Generic dip-buying loses (only 16-29% of dips bounce >= +20% in 600
+//     slots; ~half fall a further >= 20%). The kit's reversion pilot scores
+//     -4.02 SOL on the full window.
+//   - 35 coins complete, but 28 complete in their creation slot (untradeable:
+//     the harness applies the whole batch before the bot acts, and the 2-slot
+//     fill latency kills even the age-1 completer). The 7 tradeable ("slow")
+//     completers take 345-2,205 slots, end with 248-1,019 buyers and topShare
+//     0.02-0.05, dip 20-65% along the way, and pay 1.4x-11.6x from dip prices.
+//   - A dip-RECOVERY (dip >= 30% from peak, then price retakes the old peak)
+//     completes 11% of the time (11/99 events); with the dispersion filter
+//     (buyers >= 50, topShare <= 0.2, rq >= 15) it is 17% (10/60), median
+//     forward max 1.36x. "Stabilisation" triggers (no new low for 50-100
+//     slots) are value traps: 2-5% completion, EV -2.4 to -4.4 SOL.
+//   - The edge is scale-into-strength, not the entry alone: losers stall
+//     early (they never earn adds, so they only ever cost the 0.15 first
+//     buy), while winners keep rising and keep earning adds — so deployed
+//     capital concentrates into the coins that complete. Adds fire on rq
+//     growth (+5 rq above the last buy, price above the last buy's price),
+//     up to 2.0 SOL at cost per coin.
+//   - Exits ride to completion: NO take-profit; a wide trailing stop (50%
+//     below the peak value since entry — completers dip 20-65% mid-ride, so
+//     a tight stop kills the winners); stale after 600 slots; max hold 4,000.
+//   - Sells are chunked: a sell is rejected when its proceeds exceed the
+//     curve's real SOL reserves, so a big position on a collapsed coin gets
+//     stuck (this is what killed v2's completion-rider test). Each chunk's
+//     proceeds stay under ~50% of current rq.
 //
 // Everything is a pure function of the batches: no clock, no environment, no
 // randomness, so the two graded executions produce byte-identical action logs.
@@ -33,62 +38,57 @@ import type { Batch, Bot, BotState, OrderInput, Pubkey } from './vendor/makefun-
 
 /** All tunables of the strategy, in one place. */
 export interface Params {
-  // -- entry windows --
-  /** Flow window in slots for the entry tape stats. */
-  window: number;
-  /** Window in slots for the near-high check. */
-  highWindow: number;
+  // -- dip-recovery entry --
+  /** A dip arms once the price falls this far below the running peak (fraction). */
+  dipMin: number;
+  /** ...and the entry fires once the price has retraced this share of the dip
+   *  (1.0 = full retake of the old peak). */
+  recoverShare: number;
+  /** If the price falls below this share of the peak, the dip is a collapse:
+   *  reset the peak to the current price (a new regime, not a dip). */
+  collapseReset: number;
+  /** The peak must have come with at least this much real SOL behind it. */
+  minPeakRq: number;
+  /** The peak price must be at least this multiple of the create price. */
+  minPeakMult: number;
+  /** Most slots after the recovery during which the entry may still fire. */
+  recoverWindow: number;
+  /** Most the price may have run past the recovery price and still be entered. */
+  recoverChase: number;
+  // -- dispersion filter (lifetime, all trades since creation) --
+  /** Fewest distinct non-creator buyers over the coin's whole life. */
+  minBuyersDisp: number;
+  /** Largest single wallet's share of lifetime buy SOL. */
+  maxTopShareDisp: number;
+  // -- entry bounds --
+  /** Real SOL bounds at entry. */
+  minRqEntry: number;
+  maxRqEntry: number;
   /** Youngest age (slots since CreateEvent) at which a coin may be bought. */
   minAge: number;
-  /** Oldest age at which a first buy may still be decided. */
-  maxAge: number;
-  // -- strength filter --
-  /** Real SOL bounds at entry. */
-  minRealSol: number;
-  maxRealSol: number;
-  /** Distinct non-creator buyers over the coin's whole life. */
-  minBuyers: number;
-  /** Most distinct lifetime buyers (0 = no cap). On this tape completers are
-   *  whale-driven: at rq 12, coins with 0-5 buyers complete 28% of the time,
-   *  coins with 40+ buyers 0%. A low cap is the real anti-farm filter. */
-  maxBuyers: number;
-  /** Price over create price, minus 1: lower and upper bounds. */
+  /** Price over create price, minus 1: lower bound at entry. */
   minMult: number;
-  maxMult: number;
-  /** Net buy SOL (buys minus sells) over the flow window. */
-  minNetSol: number;
-  /** Buy trades in the flow window. */
-  minBuys: number;
-  /** Distinct buying wallets in the flow window. */
-  minWindowBuyers: number;
-  /** Price now at least this share of the high over highWindow. */
-  nearHigh: number;
-  /** Largest single wallet's share of the window's buy SOL (wallet-farm filter). */
-  maxTopShare: number;
-  /** Smallest single wallet's share of the window's buy SOL (0 = no floor).
-   *  Completers are whale-pushed: at rq 12, topShare 0.4-0.6 completes 25%
-   *  of the time vs 2% for 0-0.2. */
-  minTopShare: number;
   // -- sizing --
   /** First buy of a position (SOL). */
   firstBuySol: number;
-  /** Each add-on buy (SOL). */
-  addBuySol: number;
+  /** Each add-on buy (SOL), clipped by the 1%-of-reserve order cap. */
+  addSol: number;
   /** Most SOL at cost in one position. */
   stakeSol: number;
   /** Smallest buy worth sending. */
   minBuySol: number;
   /** Slippage on buys (bps); sells always go out wide open. */
   buySlipBps: number;
+  /** Add only once real SOL has risen this much above the last buy's rq. */
+  addRqStep: number;
   // -- exits --
-  /** Sell the whole position once its value reaches cost * (1 + takeProfit). */
+  /** Sell the whole position once its value reaches cost * (1 + takeProfit).
+   *  v3 rides to completion, so this is set so high it effectively never fires. */
   takeProfit: number;
-  /** Sell once its value falls to cost * (1 - stopLoss). */
+  /** Last-resort floor: sell once value falls to cost * (1 - stopLoss). */
   stopLoss: number;
-  /** Trailing stop from the position's best value, once armed. */
+  /** Trailing stop from the position's best value since entry (fraction). */
   trail: number;
-  /** The trailing stop arms once value reached cost * (1 + trailArm). */
-  trailArm: number;
   /** Exit after this many slots held (unless the position is up). */
   maxHold: number;
   /** Exit when no trade has hit the coin for this many slots. */
@@ -99,11 +99,8 @@ export interface Params {
   cooldown: number;
   /** Most entries per coin over the run. */
   maxEntries: number;
-  // -- adds --
-  /** Add only once the price is this much above the last buy's decision price. */
-  addStep: number;
-  /** Add only while net SOL over the flow window is at least this. */
-  addNetSol: number;
+  /** Each sell chunk's proceeds stay under this share of current real SOL. */
+  sellChunkRq: number;
   // -- caps and pacing --
   /** Most main positions open at once (the rest of the cap is for probes). */
   maxMain: number;
@@ -118,45 +115,41 @@ export interface Params {
 }
 
 export const DEFAULT_PARAMS: Params = {
-  window: 50,
-  highWindow: 100,
-  minAge: 0,
-  maxAge: 30,
-  minRealSol: 12,
-  maxRealSol: 45,
-  minBuyers: 1,
-  maxBuyers: 8,
-  minMult: 2.0,
-  maxMult: 100,
-  minNetSol: 0.5,
-  minBuys: 1,
-  minWindowBuyers: 1,
-  nearHigh: 0.95,
-  maxTopShare: 1.0,
-  minTopShare: 0.4,
+  dipMin: 0.3,
+  recoverShare: 1.0,
+  collapseReset: 0.3,
+  minPeakRq: 5,
+  minPeakMult: 2.0,
+  recoverWindow: 200,
+  recoverChase: 1.05,
+  minBuyersDisp: 50,
+  maxTopShareDisp: 0.4,
+  minRqEntry: 15,
+  maxRqEntry: 70,
+  minAge: 50,
+  minMult: 1.5,
   firstBuySol: 0.15,
-  addBuySol: 0.1,
-  stakeSol: 0.15,
+  addSol: 0.4,
+  stakeSol: 3.0,
   minBuySol: 0.01,
   buySlipBps: 1500,
-  takeProfit: 0.25,
-  stopLoss: 0.25,
-  trail: 0.2,
-  trailArm: 0.3,
-  maxHold: 600,
-  staleSlots: 200,
-  bigSellSol: 3,
+  addRqStep: 3,
+  takeProfit: 10,
+  stopLoss: 0.7,
+  trail: 0.38,
+  maxHold: 4000,
+  staleSlots: 600,
+  bigSellSol: 5,
   cooldown: 0,
   maxEntries: 1,
-  addStep: 10,
-  addNetSol: 0.1,
+  sellChunkRq: 0.5,
   maxMain: 5,
-  targetCoins: 0,
-  targetFills: 0,
+  targetCoins: 25,
+  targetFills: 60,
   paceSecs: 14_400,
   probeSol: 0.01,
   maxProbes: 1,
-  maxExposureSol: 6,
+  maxExposureSol: 9,
 };
 
 const LAMPORTS = 1e9;
@@ -171,16 +164,8 @@ const NEVER_EXITED = -1e12;
 const MAX_HOLD_EXIT_BELOW = 1.1;
 /** Probes only open on curves with this much real SOL above the bare minimum. */
 const PROBE_RESERVE_MARGIN = 1.5;
-/** Trades are kept this many slots past the high window before pruning. */
-const TRADE_KEEP_SLACK = 5;
-
-interface Trade {
-  slot: number;
-  buy: boolean;
-  sol: number;
-  user: string;
-  price: number;
-}
+/** Each sell chunk is at least this share of the position (so an exit finishes). */
+const MIN_CHUNK_SHARE = 0.05;
 
 interface Coin {
   created: number | null;
@@ -190,11 +175,33 @@ interface Coin {
   createPrice: number;
   /** Distinct non-creator buyers over the coin's whole life. */
   buyers: Set<string>;
+  /** Lifetime buy SOL per wallet (creator included), for the dispersion filter. */
+  buySolByUser: Map<string, number>;
+  /** Lifetime buy SOL across all wallets. */
+  totalBuySol: number;
   /** Slot of the most recent trade on this coin. */
   lastTradeSlot: number;
-  trades: Trade[];
   entries: number;
   lastExit: number;
+  // -- dip-recovery state (running peak since creation, or since the last reset) --
+  /** Highest trade price seen since the last reset. */
+  peakPrice: number;
+  /** Real SOL when the peak was set. */
+  peakRq: number;
+  /** True once the price has dipped dipMin below the peak and not yet recovered. */
+  dipped: boolean;
+  /** Lowest price seen while dipped (the dip's bottom). */
+  dipPrice: number;
+  /** The peak the current (or most recent) dip fell from, and its real SOL.
+   *  Kept separately from peakPrice because the recovery resets the running
+   *  peak to the recovery price. */
+  dipPeakPrice: number;
+  dipPeakRq: number;
+  /** True once the price retraced recoverShare of the dip (armed entry). */
+  recovered: boolean;
+  /** Price and slot when the recovery fired. */
+  recoveryPrice: number;
+  recoverySlot: number;
 }
 
 interface Held {
@@ -204,21 +211,11 @@ interface Held {
   invested: number;
   exiting: boolean;
   filled: boolean;
-  /** Recorded price when the last buy was decided. */
+  /** Recorded price and real SOL when the last buy was decided. */
   lastAddPrice: number;
+  lastAddRq: number;
   /** Close value at the latest batch (SOL, curve and tx fees deducted). */
   lastValue: number;
-}
-
-/** Tape stats over the flow window, accumulated in trade order. */
-interface WindowStats {
-  buySol: number;
-  sellSol: number;
-  buys: number;
-  high: number;
-  last: number;
-  /** Buy SOL per wallet inside the window. */
-  byUser: Map<string, number>;
 }
 
 export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
@@ -231,77 +228,74 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
   const myCoins = new Set<Pubkey>();
   let firstTime: number | null = null;
   let lastTime: number | null = null;
-  const keep = p.highWindow + TRADE_KEEP_SLACK;
 
   const coinOf = (mint: Pubkey): Coin => {
     let c = coins.get(mint);
     if (c === undefined) {
-      c = { created: null, creator: null, creatorSold: false, createPrice: 0, buyers: new Set(), lastTradeSlot: 0, trades: [], entries: 0, lastExit: NEVER_EXITED };
+      c = { created: null, creator: null, creatorSold: false, createPrice: 0, buyers: new Set(), buySolByUser: new Map(), totalBuySol: 0, lastTradeSlot: 0, entries: 0, lastExit: NEVER_EXITED, peakPrice: 0, peakRq: 0, dipped: false, dipPrice: 0, dipPeakPrice: 0, dipPeakRq: 0, recovered: false, recoveryPrice: 0, recoverySlot: 0 };
       coins.set(mint, c);
     }
     return c;
   };
 
-  /** Net recorded SOL (buys minus sells) over the last `w` slots. */
-  const flow = (c: Coin, now: number, w: number): number => {
-    let net = 0;
-    for (let i = c.trades.length - 1; i >= 0; i--) {
-      const tr = c.trades[i]!;
-      if (tr.slot <= now - w) break;
-      net += tr.buy ? tr.sol : -tr.sol;
-    }
-    return net;
-  };
-
-  /** Accumulate the tape stats over the flow window ending at slot `now`. */
-  const windowStats = (c: Coin, now: number): WindowStats => {
-    const from = now - p.window;
-    const stats: WindowStats = { buySol: 0, sellSol: 0, buys: 0, high: 0, last: 0, byUser: new Map() };
-    for (const tr of c.trades) {
-      if (tr.slot <= from) continue;
-      if (tr.buy) {
-        stats.buySol += tr.sol;
-        stats.buys++;
-        stats.byUser.set(tr.user, (stats.byUser.get(tr.user) ?? 0) + tr.sol);
-      } else {
-        stats.sellSol += tr.sol;
+  /** Fold one trade into a coin's dip-recovery state machine. */
+  const trackDip = (c: Coin, slot: number, price: number, rq: number): void => {
+    if (!c.dipped) {
+      if (price > c.peakPrice) {
+        c.peakPrice = price;
+        c.peakRq = rq;
       }
-      if (tr.price > stats.high) stats.high = tr.price;
-      stats.last = tr.price;
+      if (c.peakPrice > 0 && price <= c.peakPrice * (1 - p.dipMin)) {
+        c.dipped = true;
+        c.dipPrice = price;
+        c.dipPeakPrice = c.peakPrice;
+        c.dipPeakRq = c.peakRq;
+      }
+      return;
     }
-    return stats;
+    // In a dip: track the bottom, watch for the recovery or a collapse reset.
+    if (price < c.dipPrice) c.dipPrice = price;
+    const retrace = c.dipPrice + (c.peakPrice - c.dipPrice) * p.recoverShare;
+    if (price >= retrace) {
+      c.dipped = false;
+      c.recovered = true;
+      c.recoveryPrice = price;
+      c.recoverySlot = slot;
+      // The new peak is the recovery price: look for the next dip from here.
+      c.peakPrice = price;
+      c.peakRq = rq;
+      return;
+    }
+    if (price <= c.peakPrice * p.collapseReset) {
+      // A collapse, not a dip: reset the peak and forget the dip.
+      c.dipped = false;
+      c.peakPrice = price;
+      c.peakRq = rq;
+    }
   };
 
-  /** Highest trade price over the last `w` slots (0 when the coin never traded there). */
-  const highOver = (c: Coin, now: number, w: number): number => {
-    let high = 0;
-    for (let i = c.trades.length - 1; i >= 0; i--) {
-      const tr = c.trades[i]!;
-      if (tr.slot <= now - w) break;
-      if (tr.price > high) high = tr.price;
-    }
-    return high;
+  /** Largest single wallet's share of lifetime buy SOL (0 when nothing bought). */
+  const topShare = (c: Coin): number => {
+    if (c.totalBuySol <= 0) return 0;
+    let top = 0;
+    for (const v of c.buySolByUser.values()) if (v > top) top = v;
+    return top / c.totalBuySol;
   };
 
-  /** Late-strength entry signal on a coin's tape at slot `now`. */
+  /** Dip-recovery entry signal on a coin's tape at slot `now`. */
   const entrySignal = (c: Coin, now: number, rqSol: number, price: number): boolean => {
-    if (rqSol < p.minRealSol || rqSol > p.maxRealSol) return false;
-    if (c.created === null || now - c.created < p.minAge || now - c.created > p.maxAge) return false;
+    if (!c.recovered) return false;
+    if (now - c.recoverySlot > p.recoverWindow) return false;
+    if (price > c.recoveryPrice * p.recoverChase) return false;
+    if (rqSol < p.minRqEntry || rqSol > p.maxRqEntry) return false;
+    if (c.created === null || now - c.created < p.minAge) return false;
     if (c.creatorSold) return false;
     if (c.createPrice <= 0) return false;
-    const mult = price / c.createPrice;
-    if (mult < p.minMult || mult > p.maxMult) return false;
-    if (c.buyers.size < p.minBuyers) return false;
-    if (p.maxBuyers > 0 && c.buyers.size > p.maxBuyers) return false;
-    const s = windowStats(c, now);
-    if (s.buys < p.minBuys || s.byUser.size < p.minWindowBuyers) return false;
-    if (s.buySol - s.sellSol < p.minNetSol) return false;
-    const high = highOver(c, now, p.highWindow);
-    if (high > 0 && price < high * p.nearHigh) return false;
-    let top = 0;
-    for (const v of s.byUser.values()) if (v > top) top = v;
-    if (top > p.maxTopShare * s.buySol) return false;
-    if (p.minTopShare > 0 && s.buySol > 0 && top < p.minTopShare * s.buySol) return false;
+    if (price / c.createPrice < p.minMult) return false;
+    if (c.dipPeakPrice / c.createPrice < p.minPeakMult) return false;
+    if (c.dipPeakRq < p.minPeakRq) return false;
+    if (c.buyers.size < p.minBuyersDisp) return false;
+    if (topShare(c) > p.maxTopShareDisp) return false;
     return true;
   };
 
@@ -309,13 +303,30 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
   const positionValue = (tokens: number, vq: number, vt: number, tx: number): number =>
     ((tokens * vq) / (vt + tokens) / LAMPORTS) * (1 - CURVE_FEE) - tx;
 
+  /** Tokens to sell so the chunk's proceeds stay under sellChunkRq of real SOL.
+   *  A sell is rejected when its proceeds exceed the curve's real reserves, so
+   *  a big position on a collapsed coin must exit in chunks. */
+  const sellChunkTokens = (tokens: bigint, vq: number, vt: number, rqSol: number): bigint => {
+    const targetQ = (p.sellChunkRq * rqSol) / (1 - CURVE_FEE); // SOL out before fees
+    const targetLamports = targetQ * LAMPORTS;
+    if (targetLamports >= vq) return tokens; // even selling everything stays under the cap
+    // Solve t*vq/(vt+t) = targetLamports for t.
+    const t = (targetLamports * vt) / (vq - targetLamports);
+    let chunk = BigInt(Math.floor(t));
+    const minChunk = (tokens * BigInt(Math.round(MIN_CHUNK_SHARE * 100))) / 100n;
+    if (chunk < minChunk) chunk = minChunk;
+    if (chunk > tokens) chunk = tokens;
+    if (chunk <= 0n) chunk = tokens;
+    return chunk;
+  };
+
   /** Take-profit: value reached cost * (1 + takeProfit). */
   const hitTakeProfit = (value: number, cost: number): boolean => value >= cost * (1 + p.takeProfit);
-  /** Stop-loss: value fell to cost * (1 - stopLoss). */
+  /** Last-resort floor: value fell to cost * (1 - stopLoss). */
   const hitStopLoss = (value: number, cost: number): boolean => value < cost * (1 - p.stopLoss);
-  /** Trailing stop, armed once the peak reached cost * (1 + trailArm). */
-  const hitTrailingStop = (h: Held, value: number, cost: number): boolean =>
-    h.peakValue >= cost * (1 + p.trailArm) && value < h.peakValue * (1 - p.trail);
+  /** Trailing stop from the position's best value since entry, armed from the first mark. */
+  const hitTrailingStop = (h: Held, value: number): boolean =>
+    h.peakValue > 0 && value < h.peakValue * (1 - p.trail);
   /** Time limit: held past maxHold while below MAX_HOLD_EXIT_BELOW of cost. */
   const heldTooLong = (h: Held, value: number, cost: number, now: number): boolean =>
     now - h.opened > p.maxHold && value < cost * MAX_HOLD_EXIT_BELOW;
@@ -327,7 +338,7 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
     if (h.exiting) return true;
     if (hitTakeProfit(value, cost)) return true;
     if (hitStopLoss(value, cost)) return true;
-    if (hitTrailingStop(h, value, cost)) return true;
+    if (hitTrailingStop(h, value)) return true;
     if (bigSell) return true;
     if (c.creatorSold) return true;
     if (goneStale(c, now)) return true;
@@ -341,13 +352,6 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
       if (po.order.mint === mint && po.order.side === 'sell') return true;
     }
     return false;
-  };
-
-  /** Drop trades older than the high window (plus slack) from a coin's tape. */
-  const pruneTrades = (c: Coin, now: number): void => {
-    let cut = 0;
-    while (cut < c.trades.length && c.trades[cut]!.slot <= now - keep) cut++;
-    if (cut > 0) c.trades.splice(0, cut);
   };
 
   /** SOL at cost across all open positions (larger of recorded buys and harness cost). */
@@ -364,14 +368,15 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
     return entrySignal(c, now, rqSol, price);
   };
 
-  /** Size of an add-on buy for a held position, or null when no add is warranted. */
-  const addAmount = (c: Coin, h: Held, mint: Pubkey, now: number, price: number, rqSol: number, state: BotState): number | null => {
+  /** Size of an add-on buy for a held position, or null when no add is warranted.
+   *  Adds scale into strength: real SOL must have risen addRqStep above the last
+   *  buy's rq and the price must be above the last buy's price. */
+  const addAmount = (c: Coin, h: Held, mint: Pubkey, price: number, rqSol: number, state: BotState): number | null => {
     if (h.exiting || !h.filled || h.invested >= p.stakeSol - p.minBuySol) return null;
     if (state.positions.get(mint) === undefined) return null;
-    if (price < h.lastAddPrice * (1 + p.addStep)) return null;
-    if (flow(c, now, p.window) < p.addNetSol) return null;
-    if (rqSol > p.maxRealSol) return null;
-    return Math.min(p.addBuySol, p.stakeSol - h.invested);
+    if (rqSol < h.lastAddRq + p.addRqStep) return null;
+    if (price < h.lastAddPrice) return null;
+    return Math.min(p.addSol, p.stakeSol - h.invested);
   };
 
   /** Which guardrail counters lag the pace at the current clock. */
@@ -413,7 +418,7 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
       // --- intake: count the bot's own fills ---
       for (const f of batch.fills) countFill(f);
 
-      // --- intake: fold the batch's events into the per-coin tape ---
+      // --- intake: fold the batch's events into the per-coin state ---
       for (const e of batch.events) {
         if (e.block_time !== null) {
           if (firstTime === null) firstTime = e.block_time;
@@ -427,23 +432,20 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         } else if (e.event === 'TradeEvent') {
           const c = coinOf(e.mint);
           const sol = Number(e.sol_amount) / LAMPORTS;
-          c.trades.push({
-            slot: e.slot,
-            buy: e.is_buy,
-            sol,
-            user: e.user,
-            price: Number(e.virtual_quote_reserves) / Number(e.virtual_token_reserves),
-          });
+          const price = Number(e.virtual_quote_reserves) / Number(e.virtual_token_reserves);
+          const rq = Number(e.real_quote_reserves) / LAMPORTS;
           c.lastTradeSlot = e.slot;
           traded.add(e.mint);
-          if (e.is_buy && e.user !== c.creator) c.buyers.add(e.user);
+          if (e.is_buy) {
+            c.buySolByUser.set(e.user, (c.buySolByUser.get(e.user) ?? 0) + sol);
+            c.totalBuySol += sol;
+            if (e.user !== c.creator) c.buyers.add(e.user);
+          }
           if (!e.is_buy && sol >= p.bigSellSol) bigSell.add(e.mint);
           if (!e.is_buy && c.creator !== null && e.user === c.creator) c.creatorSold = true;
+          trackDip(c, e.slot, price, rq);
         }
       }
-
-      // --- prune trades older than the high window (plus slack) ---
-      for (const mint of traded) pruneTrades(coins.get(mint)!, now);
 
       const marks = new Map(batch.marks.map((m) => [m.mint, m] as const));
       const pendingByMint = new Map<Pubkey, number>();
@@ -453,7 +455,7 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
       const cap = state.hello.caps.max_orders_per_batch;
       const tx = Number(state.txFeeLamports()) / LAMPORTS;
 
-      // --- phase 1: exits first ---
+      // --- phase 1: exits first (chunked sells) ---
       for (const [mint, h] of held) {
         const pos = state.positions.get(mint);
         const curve = state.curves.get(mint);
@@ -471,6 +473,7 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         const mk = marks.get(mint);
         const vq = mk ? Number(mk.virtual_quote_reserves) : Number(curve.virtual_quote_reserves);
         const vt = mk ? Number(mk.virtual_token_reserves) : Number(curve.virtual_token_reserves);
+        const rqSol = Number(curve.real_quote_reserves) / LAMPORTS;
         const value = positionValue(Number(pos.token_amount), vq, vt, tx);
         const cost = Number(pos.cost_lamports) / LAMPORTS;
         if (value > h.peakValue) h.peakValue = value;
@@ -480,7 +483,8 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         h.exiting = true;
         if (pendingByMint.has(mint) && hasPendingSell(state, mint)) continue;
         if (orders.length >= cap) break;
-        orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: SELL_SLIP_BPS });
+        const chunk = sellChunkTokens(pos.token_amount, vq, vt, rqSol);
+        orders.push({ side: 'sell', mint, token_amount: chunk, max_slippage_bps: SELL_SLIP_BPS });
       }
 
       // --- phase 2: probe round trips — sell the whole probe once its buy has landed ---
@@ -516,8 +520,9 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
           if (!mayEnter(c, now, rqSol, price, slotsLeft, mainLeft)) continue;
           want = p.firstBuySol;
         } else {
-          // Add into strength only: the price stepped up from the last add and flow is positive.
-          const add = addAmount(c, h, mint, now, price, rqSol, state);
+          // Add into strength only: real SOL climbed a step past the last buy
+          // and the price is above the last buy's price.
+          const add = addAmount(c, h, mint, price, rqSol, state);
           if (add === null) continue;
           want = add;
         }
@@ -527,13 +532,14 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         free -= amount + tx;
         exposure += amount;
         if (h === undefined) {
-          held.set(mint, { opened: now, peakValue: 0, invested: amount, exiting: false, filled: false, lastAddPrice: price, lastValue: 0 });
+          held.set(mint, { opened: now, peakValue: 0, invested: amount, exiting: false, filled: false, lastAddPrice: price, lastAddRq: rqSol, lastValue: 0 });
           c.entries++;
           slotsLeft--;
           mainLeft--;
         } else {
           h.invested += amount;
           h.lastAddPrice = price;
+          h.lastAddRq = rqSol;
         }
       }
 
