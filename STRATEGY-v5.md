@@ -110,6 +110,27 @@ check.
   v5's backtest +6.249 would sit between #1 and #2 on the dev board if
   grade-local tracks the backtest as it did for v3 (within ~0.05 SOL).
 
+## Stress comparison vs v3 (grade-local --stress, 20 block surrogates)
+
+| | v3 | v5 |
+|---|---|---|
+| Dev grade-local net | +3.021 | +5.969 |
+| Stress median | -0.90 | -1.37 |
+| Stress p10 | -1.86 | -2.15 |
+| Stress p90 | -0.07 | -0.18 |
+| Copies losing money | 18/20 | 19/20 |
+
+v5's stress median/p10 are WORSE than v3's: v5 makes more trades (65 vs 52
+trips), and in rebuilt windows — where the completer sequences are shuffled
+apart — the extra momentum/creator-sold trades mostly lose without the
+completer payoff. Both versions draw the same two warnings (dev score above
+90% of copies; half or more copies lost money). The trade: v5's dev net is
++2.95 SOL better and its 90% interval (-0.35..+15.42) far better than v3's
+(-3.52..+13.15), against ~0.5 SOL worse downside in the no-completer
+scenario. The final window is a real window with real completers, not a
+block-shuffled surrogate — v5 is the better entry for it, but the stress
+result is the honest caveat.
+
 ## Honest caveat
 
 The tradeable-completer sample is 7 coins, and v5's two biggest wins from
